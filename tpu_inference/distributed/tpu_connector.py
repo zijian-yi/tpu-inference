@@ -113,23 +113,23 @@ logger = init_logger(__name__)
 @dataclass
 class SendMeta:
     uuid: int
-    trace_headers: dict | None = None
     # `list[int]`       used for non-HMA connector
     # `list[list[int]]` used for HMA connector (per-kv-cache-group)
     local_block_ids: list[int] | list[list[int]]
     expiration_time: float
+    trace_headers: dict | None = None
 
 
 @dataclass
 class LoadMeta:
     uuid: int
-    trace_headers: dict | None = None
     # `list[int]`       used for non-HMA connector.
     # `list[list[int]]` used for HMA connector (per-kv-cache-group).
     local_block_ids: list[int] | list[list[int]] | None
     remote_block_ids: list[int] | list[list[int]] | None
     remote_host: str | list[str]
     remote_port: int | list[int]
+    trace_headers: dict | None = None
 
 
 # The metadata used for communicating between scheduler and worker connectors.
@@ -799,13 +799,15 @@ class TPUConnectorWorker:
 
         try:
             import time
+            end_time_ns = time.time_ns()
+            start_time_ns = end_time_ns - int((end_time - start_time) * 1e9)
             from vllm.tracing import instrument_manual, extract_trace_context
             ctx = extract_trace_context(req_meta.trace_headers) if req_meta.trace_headers else None
             if ctx:
                 instrument_manual(
                     "tpu_async_d2h_and_transfer",
-                    start_time=int(start_time * 1e9),
-                    end_time=int(end_time * 1e9),
+                    start_time=start_time_ns,
+                    end_time=end_time_ns,
                     context=ctx,
                     attributes={"request_id": req_id}
                 )
@@ -884,24 +886,31 @@ class TPUConnectorWorker:
                 self.transfer_stats.record_failed_transfer()
 
         try:
+            import time
+            end_time_ns = time.time_ns()
+            end_perf = end_time_1 if end_time_1 is not None else end_time_0
+            start_time_ns = end_time_ns - int((end_perf - start_time) * 1e9)
             from vllm.tracing import instrument_manual, extract_trace_context
             ctx = extract_trace_context(req_meta.trace_headers) if getattr(req_meta, "trace_headers", None) else None
             if ctx:
                 instrument_manual(
                     "tpu_pull_kv",
-                    start_time=int(start_time * 1e9),
-                    end_time=int(end_time_1 * 1e9),
+                    start_time=start_time_ns,
+                    end_time=end_time_ns,
                     context=ctx,
                     attributes={"request_id": req_id, "size_mb": kv_size_mb}
                 )
         except ImportError:
             pass
-            logger.info(
-                f"Worker {self.node_id} --> kv transfer | done pull req_id={req_id} | "
-                f"uuid={req_meta.uuid} | prepare time={prepare_time_ms:.2f}ms | "
-                f"size={kv_size_mb:.2f}MB")
-            self.transfer_stats.record_successful_transfer(
-                prepare_time_ms, pull_time_ms, kv_size_mb)
+        else:
+            if not dist_utils.get_enable_block_kv_transfer():
+                pull_time_ms = 0.0
+                logger.info(
+                    f"Worker {self.node_id} --> kv transfer | done pull req_id={req_id} | "
+                    f"uuid={req_meta.uuid} | prepare time={prepare_time_ms:.2f}ms | "
+                    f"size={kv_size_mb:.2f}MB")
+                self.transfer_stats.record_successful_transfer(
+                    prepare_time_ms, pull_time_ms, kv_size_mb)
         return kv
 
     def _get_kv_spec(self, num_blocks: int) -> list[jax.ShapeDtypeStruct]:
