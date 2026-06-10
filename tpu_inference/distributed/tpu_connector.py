@@ -113,6 +113,7 @@ logger = init_logger(__name__)
 @dataclass
 class SendMeta:
     uuid: int
+    trace_headers: dict | None = None
     # `list[int]`       used for non-HMA connector
     # `list[list[int]]` used for HMA connector (per-kv-cache-group)
     local_block_ids: list[int] | list[list[int]]
@@ -122,6 +123,7 @@ class SendMeta:
 @dataclass
 class LoadMeta:
     uuid: int
+    trace_headers: dict | None = None
     # `list[int]`       used for non-HMA connector.
     # `list[list[int]]` used for HMA connector (per-kv-cache-group).
     local_block_ids: list[int] | list[list[int]] | None
@@ -358,6 +360,7 @@ class TPUConnectorScheduler():
 
             self.reqs_to_load[request.request_id] = LoadMeta(
                 uuid=params["uuid"],
+                trace_headers=params.get("trace_headers"),
                 local_block_ids=local_block_ids,
                 remote_block_ids=params["remote_block_ids"],
                 remote_host=params["remote_host"],
@@ -370,6 +373,7 @@ class TPUConnectorScheduler():
             # In both cases we need to send notification to let P free memory.
             self.reqs_to_load[request.request_id] = LoadMeta(
                 uuid=params["uuid"],
+                trace_headers=params.get("trace_headers"),
                 local_block_ids=blocks.get_block_ids()[0],
                 remote_block_ids=None,
                 remote_host=params["remote_host"],
@@ -448,6 +452,7 @@ class TPUConnectorScheduler():
             ) + dist_utils.get_p2p_wait_pull_timeout()
             self.reqs_to_send[request.request_id] = SendMeta(
                 uuid=uuid,
+                trace_headers=getattr(request, "trace_headers", None),
                 local_block_ids=computed_block_ids,
                 expiration_time=expiration_time)
             kv_transfer_params = dict(uuid=uuid,
@@ -792,6 +797,21 @@ class TPUConnectorWorker:
             self.kv_transfer_server.await_pull(req_meta.uuid,
                                                updated_dest_buffer)
 
+        try:
+            import time
+            from vllm.tracing import instrument_manual, extract_trace_context
+            ctx = extract_trace_context(req_meta.trace_headers) if req_meta.trace_headers else None
+            if ctx:
+                instrument_manual(
+                    "tpu_async_d2h_and_transfer",
+                    start_time=int(start_time * 1e9),
+                    end_time=int(end_time * 1e9),
+                    context=ctx,
+                    attributes={"request_id": req_id}
+                )
+        except ImportError:
+            pass
+
     def _maybe_build_kv_connection(self, req_meta: LoadMeta) -> Any:
         if isinstance(req_meta.remote_host, list):
             assert len(req_meta.remote_host) == len(req_meta.remote_port)
@@ -862,7 +882,20 @@ class TPUConnectorWorker:
                     f"uuid={req_meta.uuid} | prepare time={prepare_time_ms:.2f}ms | "
                     f"size={kv_size_mb:.2f}MB")
                 self.transfer_stats.record_failed_transfer()
-        else:
+
+        try:
+            from vllm.tracing import instrument_manual, extract_trace_context
+            ctx = extract_trace_context(req_meta.trace_headers) if getattr(req_meta, "trace_headers", None) else None
+            if ctx:
+                instrument_manual(
+                    "tpu_pull_kv",
+                    start_time=int(start_time * 1e9),
+                    end_time=int(end_time_1 * 1e9),
+                    context=ctx,
+                    attributes={"request_id": req_id, "size_mb": kv_size_mb}
+                )
+        except ImportError:
+            pass
             logger.info(
                 f"Worker {self.node_id} --> kv transfer | done pull req_id={req_id} | "
                 f"uuid={req_meta.uuid} | prepare time={prepare_time_ms:.2f}ms | "
