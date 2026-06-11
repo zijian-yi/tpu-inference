@@ -360,11 +360,11 @@ class TPUConnectorScheduler():
 
             self.reqs_to_load[request.request_id] = LoadMeta(
                 uuid=params["uuid"],
-                trace_headers=params.get("trace_headers"),
                 local_block_ids=local_block_ids,
                 remote_block_ids=params["remote_block_ids"],
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                trace_headers=getattr(request, "trace_headers", None),
             )
         else:
             # This branch means two cases:
@@ -373,11 +373,11 @@ class TPUConnectorScheduler():
             # In both cases we need to send notification to let P free memory.
             self.reqs_to_load[request.request_id] = LoadMeta(
                 uuid=params["uuid"],
-                trace_headers=params.get("trace_headers"),
                 local_block_ids=blocks.get_block_ids()[0],
                 remote_block_ids=None,
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                trace_headers=getattr(request, "trace_headers", None),
             )
 
         # Only trigger 1 KV transfer per request.
@@ -386,6 +386,8 @@ class TPUConnectorScheduler():
         logger.info(
             f"TPUConnector Scheduler update_state_after_alloc -->  reqs_to_load={self.reqs_to_load}"
         )
+        if request.request_id in self.reqs_to_load:
+            logger.info(f"[decode - 1] Scheduler queued load for req_id={request.request_id}, uuid={params['uuid']}")
 
     def build_connector_meta(self) -> TPUConnectorMetadata:
         """
@@ -452,9 +454,9 @@ class TPUConnectorScheduler():
             ) + dist_utils.get_p2p_wait_pull_timeout()
             self.reqs_to_send[request.request_id] = SendMeta(
                 uuid=uuid,
-                trace_headers=getattr(request, "trace_headers", None),
                 local_block_ids=computed_block_ids,
-                expiration_time=expiration_time)
+                expiration_time=expiration_time,
+                trace_headers=getattr(request, "trace_headers", None))
             kv_transfer_params = dict(uuid=uuid,
                                       remote_block_ids=computed_block_ids,
                                       remote_host=self.kv_ip,
@@ -462,6 +464,7 @@ class TPUConnectorScheduler():
             logger.info(
                 f"TPUConnector Scheduler ---->  generated reqs_to_send={self.reqs_to_send} | "
                 f"kv_transfer_params={kv_transfer_params}")
+            logger.info(f"[prefill - 1] Scheduler queued send for req_id={request.request_id}, uuid={uuid}")
         else:
             kv_transfer_params = {}
 
@@ -610,7 +613,23 @@ class TPUConnectorWorker:
                 )
                 if req_id in self.reqs_wait_pull:
                     # Set the expiration time of this request to -1, mark to be done
-                    buffer, _, buffer_index = self.reqs_wait_pull[req_id]
+                    logger.info(f"[prefill - 3] Worker received pull done notification for req_id={req_id}, uuid={uuid}")
+                    val = self.reqs_wait_pull[req_id]
+                    buffer, _, buffer_index = val[0], val[1], val[2]
+                    if len(val) >= 5:
+                        start_time_ns, ctx = val[3], val[4]
+                        if ctx:
+                            from vllm.tracing import instrument_manual
+                            instrument_manual(
+                                "tpu_kv_producer_await",
+                                start_time=start_time_ns,
+                                end_time=time.time_ns(),
+                                context=ctx,
+                                attributes={"request_id": req_id, "uuid": uuid}
+                            )
+                        else:
+                            logger.warning(f"Missing trace context for request {req_id} during tpu_kv_producer_await! Trace will be orphaned.")
+                    
                     if buffer_index != -1 and self.host_kv_pool is not None:
                         self.host_kv_pool.return_buffer(buffer_index, buffer)
                     self.reqs_wait_pull[req_id][1] = -1
@@ -656,6 +675,7 @@ class TPUConnectorWorker:
                 # TODO(xiang): pad block_ids to avoid recompilation
                 conn = self._maybe_build_kv_connection(req_meta)
                 if req_id not in self.reqs_pulling:
+                    logger.info(f"[decode - 2] Worker started pull thread for req_id={req_id}")
                     self.reqs_pulling[req_id] = [
                         self.pull_executor.submit(self._pull_kv, req_id, conn,
                                                   req_meta), None,
@@ -670,16 +690,38 @@ class TPUConnectorWorker:
                     _, kv, block_numbers = self.reqs_pulling.pop(req_id)
                     if len(block_numbers) > 0:
                         start_time = time.perf_counter()
+                        start_time_ns = time.time_ns()
                         self.runner.kv_caches = insert_kv_chunks(
                             self.runner.kv_caches, kv, block_numbers,
                             self.mesh, self.sharding.spec)
+                        import jax
+                        jax.tree_util.tree_map(lambda x: x.block_until_ready(), self.runner.kv_caches)
                         end_time = time.perf_counter()
+                        end_time_ns = time.time_ns()
                         logger.info(
                             f"TPUConnector Worker {self.node_id} --> req_id={req_id}, takes {(end_time - start_time)*1000:.2f}ms for insert_kv_chunks"
                         )
+                        from vllm.tracing import instrument_manual, extract_trace_context
+                        trace_headers = getattr(req_meta, "trace_headers", None)
+                        if not trace_headers:
+                            logger.warning(f"Missing trace_headers for request {req_id} during tpu_kv_consumer_insert! Trace will be orphaned.")
+                        else:
+                            ctx = extract_trace_context(trace_headers)
+                            if not ctx:
+                                logger.warning(f"Failed to extract trace context from headers for request {req_id}.")
+                            else:
+                                instrument_manual(
+                                    "tpu_kv_consumer_insert",
+                                    start_time=start_time_ns,
+                                    end_time=end_time_ns,
+                                    context=ctx,
+                                    attributes={"request_id": req_id}
+                                )
+                        logger.info(f"[decode - 4] Worker inserted kv chunks for req_id={req_id}")
                     # The request has finished pulling the KV from remote, or it has full local
                     # prefix cache, need to notify P to let it free blocks.
                     socket = self._maybe_build_notif_socket(req_meta)
+                    logger.info(f"[decode - 5] Worker sent pull done notification for req_id={req_id}")
                     self._notify_pull_done(socket, req_id, req_meta.uuid)
                 else:
                     logger.info(
@@ -714,8 +756,13 @@ class TPUConnectorWorker:
             # calling await_pull, it could be a stranding buffer if D never pulls it.
             # So we have to set use_raw_buffers=False and stores the kv, then the kv buffer
             # will be safely destroyed by either D notifying or expiration.
+            start_time_ns = time.time_ns()
+            from vllm.tracing import extract_trace_context
+            trace_headers = getattr(req_meta, "trace_headers", None)
+            ctx = extract_trace_context(trace_headers) if trace_headers else None
+            
             self.reqs_wait_pull[req_id] = [
-                kv, req_meta.expiration_time, buffer_idx
+                kv, req_meta.expiration_time, buffer_idx, start_time_ns, ctx
             ]
             self.kv_pull_uuid_to_req_id_map[req_meta.uuid] = req_id
 
@@ -728,8 +775,10 @@ class TPUConnectorWorker:
                         request_id=trim_request_id_suffix(req_id),
                         bytes=kv_size_bytes,
                         dimensions=dims_str):
+                    logger.info(f"[prefill - 2] Worker exposed kv for pull for req_id={req_id}, uuid={req_meta.uuid}")
                     self.kv_transfer_server.await_pull(req_meta.uuid, kv)
             else:
+                logger.info(f"[prefill - 2] Worker exposed kv for pull for req_id={req_id}, uuid={req_meta.uuid}")
                 self.kv_transfer_server.await_pull(req_meta.uuid, kv)
 
     def _async_d2h_and_transfer(self, req_id: str, req_meta: SendMeta,
@@ -745,6 +794,7 @@ class TPUConnectorWorker:
             f"Worker {self.node_id} -->get the buffer id {buffer_idx}")
         updated_dest_buffer = []
 
+        start_time_ns = time.time_ns()
         start_time = time.perf_counter()
         sliced_dest_buffer = [
             jax.lax.slice_in_dim(dest, 0, num_valid_blocks)
@@ -767,6 +817,24 @@ class TPUConnectorWorker:
                 break
             time.sleep(0.001)
 
+        end_time_ns = time.time_ns()
+        from vllm.tracing import instrument_manual, extract_trace_context
+        trace_headers = getattr(req_meta, "trace_headers", None)
+        if not trace_headers:
+            logger.warning(f"Missing trace_headers for request {req_id} during tpu_kv_producer_d2h! Trace will be orphaned.")
+        else:
+            ctx = extract_trace_context(trace_headers)
+            if not ctx:
+                logger.warning(f"Failed to extract trace context from headers for request {req_id}.")
+            else:
+                instrument_manual(
+                    "tpu_kv_producer_d2h",
+                    start_time=start_time_ns,
+                    end_time=end_time_ns,
+                    context=ctx,
+                    attributes={"request_id": req_id, "uuid": req_meta.uuid}
+                )
+
         d2h_slice_time = (time_1 - start_time) * 1000
         d2h_transfer_time = (end_time - time_1) * 1000
         logger.info(
@@ -776,8 +844,13 @@ class TPUConnectorWorker:
                                                 d2h_transfer_time)
 
         # 4. Network transfer
+        start_time_ns = time.time_ns()
+        from vllm.tracing import extract_trace_context
+        trace_headers = getattr(req_meta, "trace_headers", None)
+        ctx = extract_trace_context(trace_headers) if trace_headers else None
+        
         self.reqs_wait_pull[req_id] = [
-            dest_buffer, req_meta.expiration_time, buffer_idx
+            dest_buffer, req_meta.expiration_time, buffer_idx, start_time_ns, ctx
         ]
         self.kv_pull_uuid_to_req_id_map[req_meta.uuid] = req_id
 
@@ -791,28 +864,13 @@ class TPUConnectorWorker:
                     request_id=trim_request_id_suffix(req_id),
                     bytes=kv_size_bytes,
                     dimensions=dims_str):
+                logger.info(f"[prefill - 2] Worker exposed kv for pull (D2H) for req_id={req_id}, uuid={req_meta.uuid}")
                 self.kv_transfer_server.await_pull(req_meta.uuid,
                                                    updated_dest_buffer)
         else:
+            logger.info(f"[prefill - 2] Worker exposed kv for pull (D2H) for req_id={req_id}, uuid={req_meta.uuid}")
             self.kv_transfer_server.await_pull(req_meta.uuid,
                                                updated_dest_buffer)
-
-        try:
-            import time
-            end_time_ns = time.time_ns()
-            start_time_ns = end_time_ns - int((end_time - start_time) * 1e9)
-            from vllm.tracing import instrument_manual, extract_trace_context
-            ctx = extract_trace_context(req_meta.trace_headers) if req_meta.trace_headers else None
-            if ctx:
-                instrument_manual(
-                    "tpu_async_d2h_and_transfer",
-                    start_time=start_time_ns,
-                    end_time=end_time_ns,
-                    context=ctx,
-                    attributes={"request_id": req_id}
-                )
-        except ImportError:
-            pass
 
     def _maybe_build_kv_connection(self, req_meta: LoadMeta) -> Any:
         if isinstance(req_meta.remote_host, list):
@@ -844,6 +902,7 @@ class TPUConnectorWorker:
         logger.info(
             f"Worker {self.node_id} --> kv transfer | start pull req_id={req_id} | uuid={req_meta.uuid}"
         )
+        start_time_ns = time.time_ns()
         start_time = time.perf_counter()
         if jax.profiler.TraceAnnotation.is_enabled():
             dims_str, expected_bytes = get_kv_transfer_metadata(kv_spec)
@@ -876,6 +935,7 @@ class TPUConnectorWorker:
                     f"uuid={req_meta.uuid} | prepare time={prepare_time_ms:.2f}ms | "
                     f"pull time={pull_time_ms:.2f}ms | size={kv_size_mb:.2f}MB"
                 )
+                logger.info(f"[decode - 3] Worker finished pulling kv for req_id={req_id}, uuid={req_meta.uuid}")
                 self.transfer_stats.record_successful_transfer(
                     prepare_time_ms, pull_time_ms, kv_size_mb)
             else:
@@ -885,32 +945,33 @@ class TPUConnectorWorker:
                     f"size={kv_size_mb:.2f}MB")
                 self.transfer_stats.record_failed_transfer()
 
-        try:
-            import time
-            end_time_ns = time.time_ns()
-            end_perf = end_time_1 if end_time_1 is not None else end_time_0
-            start_time_ns = end_time_ns - int((end_perf - start_time) * 1e9)
-            from vllm.tracing import instrument_manual, extract_trace_context
-            ctx = extract_trace_context(req_meta.trace_headers) if getattr(req_meta, "trace_headers", None) else None
-            if ctx:
+        else:
+            logger.info(
+                f"Worker {self.node_id} --> kv transfer | done pull req_id={req_id} | "
+                f"uuid={req_meta.uuid} | prepare time={prepare_time_ms:.2f}ms | "
+                f"size={kv_size_mb:.2f}MB")
+            logger.info(f"[decode - 3] Worker finished pulling kv for req_id={req_id}, uuid={req_meta.uuid}")
+            self.transfer_stats.record_successful_transfer(
+                prepare_time_ms, pull_time_ms, kv_size_mb)
+        
+        end_time_ns = time.time_ns()
+        from vllm.tracing import instrument_manual, extract_trace_context
+        trace_headers = getattr(req_meta, "trace_headers", None)
+        if not trace_headers:
+            logger.warning(f"Missing trace_headers for request {req_id} during tpu_kv_consumer_pull_network! Trace will be orphaned.")
+        else:
+            ctx = extract_trace_context(trace_headers)
+            if not ctx:
+                logger.warning(f"Failed to extract trace context from headers for request {req_id}.")
+            else:
                 instrument_manual(
-                    "tpu_pull_kv",
+                    "tpu_kv_consumer_pull_network",
                     start_time=start_time_ns,
                     end_time=end_time_ns,
                     context=ctx,
-                    attributes={"request_id": req_id, "size_mb": kv_size_mb}
+                    attributes={"request_id": req_id, "uuid": req_meta.uuid, "size_mb": kv_size_mb}
                 )
-        except ImportError:
-            pass
-        else:
-            if not dist_utils.get_enable_block_kv_transfer():
-                pull_time_ms = 0.0
-                logger.info(
-                    f"Worker {self.node_id} --> kv transfer | done pull req_id={req_id} | "
-                    f"uuid={req_meta.uuid} | prepare time={prepare_time_ms:.2f}ms | "
-                    f"size={kv_size_mb:.2f}MB")
-                self.transfer_stats.record_successful_transfer(
-                    prepare_time_ms, pull_time_ms, kv_size_mb)
+
         return kv
 
     def _get_kv_spec(self, num_blocks: int) -> list[jax.ShapeDtypeStruct]:
@@ -968,7 +1029,8 @@ class TPUConnectorWorker:
         # This req can then be released blocks in the current scheduler step.
         now = time.perf_counter()
         for req_id in list(self.reqs_wait_pull):
-            buffer, expires, buffer_index = self.reqs_wait_pull[req_id]
+            val = self.reqs_wait_pull[req_id]
+            buffer, expires, buffer_index = val[0], val[1], val[2]
             if now > expires:
                 if expires > 0:
                     logger.warning(
