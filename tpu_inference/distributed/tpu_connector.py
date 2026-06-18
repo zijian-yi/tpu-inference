@@ -694,8 +694,8 @@ class TPUConnectorWorker:
                         self.runner.kv_caches = insert_kv_chunks(
                             self.runner.kv_caches, kv, block_numbers,
                             self.mesh, self.sharding.spec)
-                        import jax
-                        jax.tree_util.tree_map(lambda x: x.block_until_ready(), self.runner.kv_caches)
+                        # import jax
+                        # jax.tree_util.tree_map(lambda x: x.block_until_ready(), self.runner.kv_caches)
                         end_time = time.perf_counter()
                         end_time_ns = time.time_ns()
                         logger.info(
