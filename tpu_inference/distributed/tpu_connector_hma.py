@@ -355,8 +355,8 @@ class TPUConnectorHMAWorker(TPUConnectorWorker):
                             self.mesh,
                             self.attn_sharding_spec,
                         )
-                        import jax
-                        jax.tree_util.tree_map(lambda x: x.block_until_ready(), self.runner.kv_caches)
+                        # import jax
+                        # jax.tree_util.tree_map(lambda x: x.block_until_ready(), self.runner.kv_caches)
                         end_time_ns = time.time_ns()
                         
                         from vllm.tracing import instrument_manual, extract_trace_context
