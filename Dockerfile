@@ -54,7 +54,7 @@ RUN if [ "$BM_INFRA" = "true" ]; then \
 # Build vLLM
 WORKDIR /workspace/vllm
 ARG VLLM_REPO=https://github.com/zijian-yi/vllm.git
-ARG VLLM_COMMIT_HASH="a0548586eddda9f9f2936b6485b0ac60245f33ed"
+ARG VLLM_COMMIT_HASH="40a77bf154c050bb05bc7fa11bfa8d0a6b1d1dc6"
 
 RUN git clone $VLLM_REPO . && \
     if [ -n "$VLLM_COMMIT_HASH" ]; then \
@@ -89,6 +89,24 @@ RUN if [ "$IS_TEST" = "true" ]; then \
     fi
 COPY . .
 RUN pip install -e .
+
+# Set environment variables to avoid disk space warnings/failures in Bazel
+ENV BAZEL_CACHE_DIR="${HOME}/.bazel_cache"
+ENV BAZEL_OUTPUT_BASE=/tmp/bazel_output
+
+# Restrict Bazel to 16 parallel jobs and 30GB RAM to prevent gcc OOM kill
+RUN echo "build --jobs=16 --local_ram_resources=30720" > ~/.bazelrc
+
+ARG RAIDEN_REPO=https://github.com/zijian-yi/tpu-raiden
+ARG RAIDEN_COMMIT_HASH="0017e33df0261b87dc6391a11a60c49d912f45a7"
+
+# Checkout a runnable version and build tpu-raiden for JAX only
+RUN git clone $RAIDEN_REPO /workspace/tpu-raiden \
+    && cd /workspace/tpu-raiden \
+    && git checkout $RAIDEN_COMMIT_HASH \
+    && ./build.sh jax
+
+ENV PYTHONPATH="/workspace/tpu-raiden:${PYTHONPATH}"
 
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
