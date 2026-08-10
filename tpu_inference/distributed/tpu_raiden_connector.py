@@ -111,6 +111,7 @@ class SendMeta:
     # `list[list[int]]` used for HMA connector (per-kv-cache-group)
     local_block_ids: list[int] | list[list[int]]
     expiration_time: float
+    trace_headers: dict | None = None
 
 
 @dataclass
@@ -122,6 +123,7 @@ class LoadMeta:
     remote_block_ids: list[int] | list[list[int]] | None
     remote_host: str | list[str]
     remote_port: int | list[int]
+    trace_headers: dict | None = None
 
 
 # The metadata used for communicating between scheduler and worker connectors.
@@ -356,6 +358,7 @@ class TPUConnectorScheduler():
                 remote_block_ids=params["remote_block_ids"],
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                trace_headers=getattr(request, "trace_headers", None),
             )
         else:
             # This branch means two cases:
@@ -368,6 +371,7 @@ class TPUConnectorScheduler():
                 remote_block_ids=None,
                 remote_host=params["remote_host"],
                 remote_port=params["remote_port"],
+                trace_headers=getattr(request, "trace_headers", None),
             )
 
         # Only trigger 1 KV transfer per request.
@@ -376,6 +380,8 @@ class TPUConnectorScheduler():
         logger.info(
             f"TPUConnector Scheduler update_state_after_alloc -->  reqs_to_load={self.reqs_to_load}"
         )
+        if request.request_id in self.reqs_to_load:
+            logger.info(f"[decode - 1] Scheduler queued load for req_id={request.request_id}, uuid={params['uuid']}")
 
     def build_connector_meta(self) -> TPUConnectorMetadata:
         """
@@ -443,7 +449,8 @@ class TPUConnectorScheduler():
             self.reqs_to_send[request.request_id] = SendMeta(
                 uuid=uuid,
                 local_block_ids=computed_block_ids,
-                expiration_time=expiration_time)
+                expiration_time=expiration_time,
+                trace_headers=getattr(request, "trace_headers", None))
             kv_transfer_params = dict(uuid=uuid,
                                       remote_block_ids=computed_block_ids,
                                       remote_host=self.kv_ip,
@@ -451,6 +458,7 @@ class TPUConnectorScheduler():
             logger.info(
                 f"TPUConnector Scheduler ---->  generated reqs_to_send={self.reqs_to_send} | "
                 f"kv_transfer_params={kv_transfer_params}")
+            logger.info(f"[prefill - 1] Scheduler queued send for req_id={request.request_id}, uuid={uuid}")
         else:
             kv_transfer_params = {}
 
@@ -479,6 +487,9 @@ class TPUConnectorWorker:
         # Consumer-side: req_ids for which a real pull (submit_load) was issued,
         # so the scheduler's later remote_block_ids=None notify step is a no-op.
         self._submitted: set[ReqId] = set()
+        self._sending_trace_info: dict[ReqId, tuple[int, Any, int, int, float]] = {}
+        self._recving_trace_info: dict[ReqId, tuple[int, Any, int, int, float]] = {}
+        self.bytes_per_block: int = 0
 
         self.host_ip = dist_utils.get_host_ip()
         # Bind the kv_manager control socket to the same port the scheduler
@@ -506,6 +517,10 @@ class TPUConnectorWorker:
         kv_caches = runner.kv_caches
         self.num_layers = len(kv_caches)
         self.sharding = kv_caches[0].sharding
+        if kv_caches and len(kv_caches) > 0 and kv_caches[0].shape[0] > 0:
+            self.bytes_per_block = sum(k.nbytes // k.shape[0] for k in kv_caches)
+        else:
+            self.bytes_per_block = 0
         block_size = self.vllm_config.cache_config.block_size
         max_blocks = self.vllm_config.model_config.max_model_len // block_size
         num_slots = int(os.getenv("RAIDEN_NUM_SLOTS", "16"))
@@ -573,6 +588,17 @@ class TPUConnectorWorker:
             "shards": list(ep["shards"])
         } for i, ep in enumerate(local_eps)]
 
+    def _get_transfer_bytes(self, block_ids: list[int] | list[list[int]] | None) -> tuple[int, float]:
+        if not block_ids or self.bytes_per_block == 0:
+            return 0, 0.0
+        if isinstance(block_ids[0], list):
+            num_blocks = sum(len(b) for b in block_ids)
+        else:
+            num_blocks = len(block_ids)
+        total_bytes = num_blocks * self.bytes_per_block
+        kv_size_mb = total_bytes / (1024 * 1024)
+        return total_bytes, kv_size_mb
+
     def process_send_load(self, metadata: TPUConnectorMetadata):
         """
         This is called in runner before calling model forward,
@@ -584,6 +610,14 @@ class TPUConnectorWorker:
             logger.info(
                 f"TPUConnector Worker {self.node_id} -->  reqs_to_send={reqs}")
         for req_id, req_meta in reqs.items():
+            if req_id not in self._sending_trace_info:
+                start_time_ns = time.time_ns()
+                from vllm.tracing import extract_trace_context
+                trace_headers = getattr(req_meta, "trace_headers", None)
+                ctx = extract_trace_context(trace_headers) if trace_headers else None
+                total_bytes, kv_size_mb = self._get_transfer_bytes(req_meta.local_block_ids)
+                self._sending_trace_info[req_id] = (start_time_ns, ctx, req_meta.uuid, total_bytes, kv_size_mb)
+                logger.info(f"[prefill - 2] Worker exposed kv for pull (Raiden) for req_id={req_id}, uuid={req_meta.uuid}, size={kv_size_mb:.2f}MB")
             self.kv_manager.register_read(req_id, req_meta.uuid,
                                           req_meta.local_block_ids)
 
@@ -603,6 +637,19 @@ class TPUConnectorWorker:
                     # Pre-allocated blocks may be re-issued; submit only once.
                     continue
                 self._submitted.add(req_id)
+                start_time_ns = time.time_ns()
+                from vllm.tracing import extract_trace_context
+                trace_headers = getattr(req_meta, "trace_headers", None)
+                if not trace_headers:
+                    logger.warning(f"Missing trace_headers for request {req_id} during Raiden pull! Trace will be orphaned.")
+                    ctx = None
+                else:
+                    ctx = extract_trace_context(trace_headers)
+                    if not ctx:
+                        logger.warning(f"Failed to extract trace context from headers for request {req_id}.")
+                total_bytes, kv_size_mb = self._get_transfer_bytes(req_meta.remote_block_ids)
+                self._recving_trace_info[req_id] = (start_time_ns, ctx, req_meta.uuid, total_bytes, kv_size_mb)
+                logger.info(f"[decode - 2] Worker started Raiden pull for req_id={req_id}, uuid={req_meta.uuid}, size={kv_size_mb:.2f}MB")
                 self.kv_manager.start_read(
                     req_id=req_id,
                     uuid=req_meta.uuid,
@@ -649,10 +696,46 @@ class TPUConnectorWorker:
             logger.info(
                 f"TPUConnector Worker {self.node_id} -->  done_sending={done_sending}"
             )
+            from vllm.tracing import instrument_manual
+            for req_id in done_sending:
+                if req_id in self._sending_trace_info:
+                    start_time_ns, ctx, uuid, total_bytes, kv_size_mb = self._sending_trace_info.pop(req_id)
+                    if ctx:
+                        instrument_manual(
+                            "tpu_kv_producer_await",
+                            start_time=start_time_ns,
+                            end_time=time.time_ns(),
+                            context=ctx,
+                            attributes={
+                                "request_id": req_id,
+                                "uuid": uuid,
+                                "bytes": total_bytes,
+                                "size_mb": kv_size_mb,
+                            }
+                        )
+                    logger.info(f"[prefill - 3] Worker finished sending kv (Raiden) for req_id={req_id}, uuid={uuid}, size={kv_size_mb:.2f}MB")
         if done_recving:
             logger.info(
                 f"TPUConnector Worker {self.node_id} -->  done_recving={done_recving}"
             )
+            from vllm.tracing import instrument_manual
+            for req_id in done_recving:
+                if req_id in self._recving_trace_info:
+                    start_time_ns, ctx, uuid, total_bytes, kv_size_mb = self._recving_trace_info.pop(req_id)
+                    if ctx:
+                        instrument_manual(
+                            "tpu_kv_consumer_pull_network",
+                            start_time=start_time_ns,
+                            end_time=time.time_ns(),
+                            context=ctx,
+                            attributes={
+                                "request_id": req_id,
+                                "uuid": uuid,
+                                "bytes": total_bytes,
+                                "size_mb": kv_size_mb,
+                            }
+                        )
+                    logger.info(f"[decode - 3] Worker finished receiving kv (Raiden) for req_id={req_id}, uuid={uuid}, size={kv_size_mb:.2f}MB")
         return set(done_sending), set(done_recving)
 
 

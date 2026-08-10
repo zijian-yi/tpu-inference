@@ -620,12 +620,19 @@ class TPUConnectorWorker:
                         start_time_ns, ctx = val[3], val[4]
                         if ctx:
                             from vllm.tracing import instrument_manual
+                            total_bytes = val[5] if len(val) >= 6 else sum(k.nbytes for k in buffer)
+                            kv_size_mb = total_bytes / (1024 * 1024)
                             instrument_manual(
                                 "tpu_kv_producer_await",
                                 start_time=start_time_ns,
                                 end_time=time.time_ns(),
                                 context=ctx,
-                                attributes={"request_id": req_id, "uuid": uuid}
+                                attributes={
+                                    "request_id": req_id,
+                                    "uuid": uuid,
+                                    "bytes": total_bytes,
+                                    "size_mb": kv_size_mb,
+                                }
                             )
                         else:
                             logger.warning(f"Missing trace context for request {req_id} during tpu_kv_producer_await! Trace will be orphaned.")
@@ -689,6 +696,8 @@ class TPUConnectorWorker:
                     assert self.reqs_pulling[req_id][1] is not None
                     _, kv, block_numbers = self.reqs_pulling.pop(req_id)
                     if len(block_numbers) > 0:
+                        total_bytes = sum(k.nbytes for k in kv)
+                        kv_size_mb = total_bytes / (1024 * 1024)
                         start_time = time.perf_counter()
                         start_time_ns = time.time_ns()
                         self.runner.kv_caches = insert_kv_chunks(
@@ -715,7 +724,11 @@ class TPUConnectorWorker:
                                     start_time=start_time_ns,
                                     end_time=end_time_ns,
                                     context=ctx,
-                                    attributes={"request_id": req_id}
+                                    attributes={
+                                        "request_id": req_id,
+                                        "bytes": total_bytes,
+                                        "size_mb": kv_size_mb,
+                                    }
                                 )
                         logger.info(f"[decode - 4] Worker inserted kv chunks for req_id={req_id}")
                     # The request has finished pulling the KV from remote, or it has full local
@@ -761,8 +774,9 @@ class TPUConnectorWorker:
             trace_headers = getattr(req_meta, "trace_headers", None)
             ctx = extract_trace_context(trace_headers) if trace_headers else None
             
+            total_bytes = sum(k.nbytes for k in kv)
             self.reqs_wait_pull[req_id] = [
-                kv, req_meta.expiration_time, buffer_idx, start_time_ns, ctx
+                kv, req_meta.expiration_time, buffer_idx, start_time_ns, ctx, total_bytes
             ]
             self.kv_pull_uuid_to_req_id_map[req_meta.uuid] = req_id
 
@@ -818,6 +832,8 @@ class TPUConnectorWorker:
             time.sleep(0.001)
 
         end_time_ns = time.time_ns()
+        total_bytes = sum(b.nbytes for b in updated_dest_buffer)
+        kv_size_mb = total_bytes / (1024 * 1024)
         from vllm.tracing import instrument_manual, extract_trace_context
         trace_headers = getattr(req_meta, "trace_headers", None)
         if not trace_headers:
@@ -832,7 +848,12 @@ class TPUConnectorWorker:
                     start_time=start_time_ns,
                     end_time=end_time_ns,
                     context=ctx,
-                    attributes={"request_id": req_id, "uuid": req_meta.uuid}
+                    attributes={
+                        "request_id": req_id,
+                        "uuid": req_meta.uuid,
+                        "bytes": total_bytes,
+                        "size_mb": kv_size_mb,
+                    }
                 )
 
         d2h_slice_time = (time_1 - start_time) * 1000
@@ -850,7 +871,7 @@ class TPUConnectorWorker:
         ctx = extract_trace_context(trace_headers) if trace_headers else None
         
         self.reqs_wait_pull[req_id] = [
-            dest_buffer, req_meta.expiration_time, buffer_idx, start_time_ns, ctx
+            dest_buffer, req_meta.expiration_time, buffer_idx, start_time_ns, ctx, total_bytes
         ]
         self.kv_pull_uuid_to_req_id_map[req_meta.uuid] = req_id
 
@@ -969,7 +990,12 @@ class TPUConnectorWorker:
                     start_time=start_time_ns,
                     end_time=end_time_ns,
                     context=ctx,
-                    attributes={"request_id": req_id, "uuid": req_meta.uuid, "size_mb": kv_size_mb}
+                    attributes={
+                        "request_id": req_id,
+                        "uuid": req_meta.uuid,
+                        "bytes": total_bytes,
+                        "size_mb": kv_size_mb,
+                    }
                 )
 
         return kv

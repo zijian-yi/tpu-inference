@@ -344,6 +344,8 @@ class TPUConnectorHMAWorker(TPUConnectorWorker):
                     has_blocks = any(
                         len(ids) > 0 for ids in block_ids_per_group)
                     if has_blocks:
+                        total_bytes = sum(k.nbytes for k in kv)
+                        kv_size_mb = total_bytes / (1024 * 1024)
                         start_time_ns = time.time_ns()
                         self.runner.kv_caches = _insert_kv_chunks_per_group(
                             self.runner.kv_caches,
@@ -373,7 +375,11 @@ class TPUConnectorHMAWorker(TPUConnectorWorker):
                                     start_time=start_time_ns,
                                     end_time=end_time_ns,
                                     context=ctx,
-                                    attributes={"request_id": req_id}
+                                    attributes={
+                                        "request_id": req_id,
+                                        "bytes": total_bytes,
+                                        "size_mb": kv_size_mb,
+                                    }
                                 )
                         logger.info(f"[decode - 4] Worker inserted kv chunks for req_id={req_id}")
                     # Notify Prefill so it can free the buffer.
@@ -413,8 +419,9 @@ class TPUConnectorHMAWorker(TPUConnectorWorker):
             trace_headers = getattr(req_meta, "trace_headers", None)
             ctx = extract_trace_context(trace_headers) if trace_headers else None
             
+            total_bytes = sum(k.nbytes for k in kv)
             self.reqs_wait_pull[req_id] = [
-                kv, req_meta.expiration_time, buffer_idx, start_time_ns, ctx
+                kv, req_meta.expiration_time, buffer_idx, start_time_ns, ctx, total_bytes
             ]
             self.kv_pull_uuid_to_req_id_map[req_meta.uuid] = req_id
             logger.info(f"[prefill - 2] Worker exposed kv for pull for req_id={req_id}, uuid={req_meta.uuid}")
@@ -453,6 +460,8 @@ class TPUConnectorHMAWorker(TPUConnectorWorker):
             time.sleep(0.001)
 
         end_time_ns = time.time_ns()
+        total_bytes = sum(b.nbytes for b in updated_dest_buffer)
+        kv_size_mb = total_bytes / (1024 * 1024)
         from vllm.tracing import instrument_manual, extract_trace_context
         trace_headers = getattr(req_meta, "trace_headers", None)
         if not trace_headers:
@@ -467,7 +476,12 @@ class TPUConnectorHMAWorker(TPUConnectorWorker):
                     start_time=start_time_ns,
                     end_time=end_time_ns,
                     context=ctx,
-                    attributes={"request_id": req_id, "uuid": req_meta.uuid}
+                    attributes={
+                        "request_id": req_id,
+                        "uuid": req_meta.uuid,
+                        "bytes": total_bytes,
+                        "size_mb": kv_size_mb,
+                    }
                 )
 
         start_time_ns = time.time_ns()
@@ -476,7 +490,7 @@ class TPUConnectorHMAWorker(TPUConnectorWorker):
         ctx = extract_trace_context(trace_headers) if trace_headers else None
         
         self.reqs_wait_pull[req_id] = [
-            dest_buffer, req_meta.expiration_time, buffer_idx, start_time_ns, ctx
+            dest_buffer, req_meta.expiration_time, buffer_idx, start_time_ns, ctx, total_bytes
         ]
         self.kv_pull_uuid_to_req_id_map[req_meta.uuid] = req_id
         logger.info(f"[prefill - 2] Worker exposed kv for pull (D2H) for req_id={req_id}, uuid={req_meta.uuid}")
@@ -557,10 +571,12 @@ class TPUConnectorHMAWorker(TPUConnectorWorker):
             if not ctx:
                 logger.warning(f"Failed to extract trace context from headers for request {req_id}.")
             else:
+                kv_size_mb = total_bytes / (1024 * 1024)
                 attributes = {
                     "request_id": req_id, 
                     "uuid": req_meta.uuid, 
                     "bytes": total_bytes,
+                    "size_mb": kv_size_mb,
                     "timed_out": timed_out
                 }
                 instrument_manual(
